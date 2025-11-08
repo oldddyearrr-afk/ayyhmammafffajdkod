@@ -1,3 +1,4 @@
+
 const TelegramBot = require('node-telegram-bot-api');
 const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
@@ -9,30 +10,32 @@ const CONFIG = {
     BOT_TOKEN: process.env.BOT_TOKEN,
     STREAM_URL: 'http://g.rosexz.xyz/at/sh/805768?token=SxAKVEBaQ14XUwYBBVYCD1VdBQRSB1cABAAEUVoFBw4JC1ADBQZUAVQTHBNGEEFcBQhpWAASCFcBAABTFUQTR0NXEGpaVkNeFwUHBgxVBAxGSRRFDV1XQA8ABlQKUFcFCAdXGRFCCAAXC15EWQgfGwEdQlQWXlMOalVUElAFAxQKXBdZXx5DC1tuVFRYBV1dRl8UAEYcEAtGQRNeVxMKWhwQAFxHQAAQUBMKX0AIXxVGBllECkRAGxcLEy1oREoUVUoWUF1BCAtbEwoTQRcRFUYMRW4WVUEWR1RQCVwURAwSAkAZEV8AHGpSX19bAVBNDQpYQkYKEFMXHRMJVggPQl9APUVaVkNeW0RcXUg',
     WATERMARK_TEXT: 't.me/xl9rr',
-    SEGMENT_DURATION: 14,
+    SEGMENT_DURATION: 17,
     MAX_DURATION: 40,
     TEMP_DIR: './temp',
-    PORT: process.env.PORT || 3000
+    PORT: process.env.PORT || 3000,
+    MAX_CHUNK_SIZE: 5 * 1024 * 1024, // 5MB chunks max
+    BUFFER_HIGH_WATER_MARK: 512 * 1024 // 512KB buffer
 };
 
-// Check for BOT_TOKEN
 if (!CONFIG.BOT_TOKEN) {
-    console.error('[ERROR] BOT_TOKEN not found in environment variables');
-    console.error('[ERROR] Please add BOT_TOKEN in Secrets settings');
+    console.error('[ERROR] BOT_TOKEN not found');
     process.exit(1);
 }
 
-// Bot state
+// Bot state - تقليل استخدام الذاكرة
 const state = {
     isRecording: false,
     users: new Set(),
     currentRecorder: null,
     segmentCount: 0,
-    recordingQueue: []
+    pendingSends: 0
 };
 
-// Initialize Telegram bot
-const bot = new TelegramBot(CONFIG.BOT_TOKEN, { polling: true });
+const bot = new TelegramBot(CONFIG.BOT_TOKEN, { 
+    polling: true,
+    filepath: false // تقليل الذاكرة
+});
 
 // Create temp directory
 function initTempDir() {
@@ -48,7 +51,7 @@ function initTempDir() {
     }
 }
 
-// Create scrolling watermark filter
+// Create scrolling watermark - مُحسّن
 function createScrollingWatermark() {
     return [
         {
@@ -67,71 +70,54 @@ function createScrollingWatermark() {
     ];
 }
 
-// 🚀 تسجيل مقطع إلى الذاكرة مباشرة
-function recordSegmentToMemory(segmentNum, startTime) {
+// 🚀 تسجيل مقطع بأقل ذاكرة ممكنة
+function recordSegmentOptimized(segmentNum, startTime) {
     return new Promise((resolve, reject) => {
-        const outputStream = new PassThrough();
+        const outputStream = new PassThrough({ 
+            highWaterMark: CONFIG.BUFFER_HIGH_WATER_MARK 
+        });
+        
         const chunks = [];
         let totalSize = 0;
-
+        let completed = false;
+        let timeoutId = null;
         const endTime = startTime + CONFIG.SEGMENT_DURATION;
+
         console.log(`[STREAM] #${segmentNum} [${startTime}ث → ${endTime}ث]`);
 
-        const recorder = ffmpeg(CONFIG.STREAM_URL)
-            .inputOptions([
-                '-t', CONFIG.SEGMENT_DURATION.toString(),
-                '-reconnect', '1',
-                '-reconnect_streamed', '1',
-                '-reconnect_delay_max', '5'
-            ])
-            .videoFilters(createScrollingWatermark())
-            .outputOptions([
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-crf', '23',
-                '-c:a', 'aac',
-                '-b:a', '96k',
-                '-movflags', 'frag_keyframe+empty_moov+faststart',
-                '-threads', '1',
-                '-f', 'mp4'
-            ])
-            .on('start', () => {
-                console.log(`[START] #${segmentNum} recording started`);
-            })
-            .on('progress', (progress) => {
-                if (progress.timemark) {
-                    process.stdout.write(`\r[PROGRESS] #${segmentNum}: ${progress.timemark}`);
+        timeoutId = setTimeout(() => {
+            if (!completed) {
+                console.log(`\n[TIMEOUT] #${segmentNum}`);
+                cleanup();
+                if (chunks.length > 0) {
+                    resolveWithBuffer();
+                } else {
+                    reject(new Error('TIMEOUT_NO_DATA'));
                 }
-            })
-            .on('error', (err) => {
-                console.error(`\n[ERROR] #${segmentNum}: ${err.message}`);
-                outputStream.end();
-                reject(err);
-            })
-            .on('end', () => {
-                console.log(`\n[DONE] #${segmentNum} recording completed`);
-                outputStream.end();
-            });
-
-        // جمع البيانات
-        outputStream.on('data', (chunk) => {
-            chunks.push(chunk);
-            totalSize += chunk.length;
-
-            if (totalSize > 100 * 1024 * 1024) {
-                console.log(`\n[WARN] #${segmentNum} buffer too large`);
-                outputStream.removeAllListeners('data');
-                reject(new Error('BUFFER_OVERFLOW'));
             }
-        });
+        }, 18000);
 
-        outputStream.on('end', () => {
+        const cleanup = () => {
+            completed = true;
+            if (timeoutId) clearTimeout(timeoutId);
+            outputStream.removeAllListeners();
+            outputStream.destroy();
+        };
+
+        const resolveWithBuffer = () => {
+            if (chunks.length === 0) {
+                reject(new Error('NO_DATA'));
+                return;
+            }
+            
             const buffer = Buffer.concat(chunks);
             const sizeMB = (buffer.length / 1024 / 1024).toFixed(2);
             console.log(`[BUFFER] #${segmentNum}: ${sizeMB}MB`);
-
+            
+            // تحرير الذاكرة فوراً
             chunks.length = 0;
-
+            chunks.splice(0);
+            
             resolve({
                 buffer: buffer,
                 segmentNum: segmentNum,
@@ -139,17 +125,107 @@ function recordSegmentToMemory(segmentNum, startTime) {
                 endTime: endTime,
                 size: buffer.length
             });
+        };
+
+        const recorder = ffmpeg(CONFIG.STREAM_URL)
+            .inputOptions([
+                '-t', CONFIG.SEGMENT_DURATION.toString(),
+                '-reconnect', '1',
+                '-reconnect_streamed', '1',
+                '-reconnect_delay_max', '5',
+                '-reconnect_at_eof', '1',
+                '-timeout', '8000000',
+                '-analyzeduration', '1000000',
+                '-probesize', '1000000',
+                '-fflags', '+discardcorrupt+nobuffer',
+                '-flags', 'low_delay'
+            ])
+            .videoFilters(createScrollingWatermark())
+            .outputOptions([
+                '-c:v', 'libx264',
+                '-preset', 'veryfast', // أسرع من ultrafast مع جودة أفضل
+                '-crf', '23',
+                '-tune', 'zerolatency',
+                '-profile:v', 'baseline',
+                '-level', '3.0',
+                '-c:a', 'aac',
+                '-b:a', '96k',
+                '-ar', '44100',
+                '-ac', '2',
+                '-movflags', '+frag_keyframe+empty_moov+default_base_moof+faststart',
+                '-threads', '1',
+                '-f', 'mp4',
+                '-max_muxing_queue_size', '512',
+                '-avoid_negative_ts', 'make_zero',
+                '-fflags', '+genpts'
+            ])
+            .on('start', () => {
+                console.log(`[START] #${segmentNum}`);
+            })
+            .on('progress', (progress) => {
+                if (progress.timemark) {
+                    process.stdout.write(`\r[⏱️] #${segmentNum}: ${progress.timemark}`);
+                }
+            })
+            .on('error', (err) => {
+                if (!completed) {
+                    console.error(`\n[ERROR] #${segmentNum}: ${err.message}`);
+                    cleanup();
+                    
+                    if (chunks.length > 0) {
+                        resolveWithBuffer();
+                    } else {
+                        reject(err);
+                    }
+                }
+            })
+            .on('end', () => {
+                if (!completed) {
+                    console.log(`\n[✓] #${segmentNum} done`);
+                    cleanup();
+                    resolveWithBuffer();
+                }
+            });
+
+        // جمع البيانات بحد أقصى
+        outputStream.on('data', (chunk) => {
+            if (!completed) {
+                chunks.push(chunk);
+                totalSize += chunk.length;
+
+                // حماية من تجاوز الذاكرة
+                if (totalSize > 80 * 1024 * 1024) {
+                    console.log(`\n[WARN] #${segmentNum} too large`);
+                    cleanup();
+                    reject(new Error('BUFFER_OVERFLOW'));
+                }
+            }
         });
 
-        outputStream.on('error', reject);
+        outputStream.on('error', (err) => {
+            if (!completed) {
+                console.error(`\n[STREAM ERROR] #${segmentNum}`);
+                cleanup();
+                if (chunks.length > 0) {
+                    resolveWithBuffer();
+                } else {
+                    reject(err);
+                }
+            }
+        });
 
-        recorder.pipe(outputStream, { end: true });
-        state.currentRecorder = recorder;
+        try {
+            recorder.pipe(outputStream, { end: true });
+            state.currentRecorder = recorder;
+        } catch (err) {
+            cleanup();
+            reject(err);
+        }
     });
 }
 
-// 🚀 إرسال المقطع للمستخدمين
-async function sendSegmentToUsers(segmentData) {
+// 🚀 إرسال المقطع بأقل ذاكرة
+async function sendSegmentOptimized(segmentData) {
     const { buffer, segmentNum, startTime, endTime, size } = segmentData;
     const sizeMB = (size / 1024 / 1024).toFixed(2);
 
@@ -161,29 +237,33 @@ async function sendSegmentToUsers(segmentData) {
         return;
     }
 
+    state.pendingSends++;
     let successCount = 0;
     let failCount = 0;
 
     for (const userId of state.users) {
         try {
-            const bufferStream = new PassThrough();
+            const bufferStream = new PassThrough({ 
+                highWaterMark: CONFIG.BUFFER_HIGH_WATER_MARK 
+            });
             bufferStream.end(buffer);
 
             await bot.sendVideo(userId, bufferStream, {
                 caption: 
-                    `🎬 *مقطع #${segmentNum}*\n\n` +
+                    `🎬 #${segmentNum}\n` +
                     `⏱️ [${startTime}ث → ${endTime}ث]\n` +
-                    `💾 ${sizeMB}MB\n` +
-                    `📅 ${new Date().toLocaleString('ar-EG')}`,
-                parse_mode: 'Markdown',
+                    `💾 ${sizeMB}MB`,
                 supports_streaming: true
+            }, {
+                contentType: 'video/mp4',
+                filename: `seg_${segmentNum}.mp4`
             });
 
             successCount++;
             console.log(`[OK] ✅ ${userId}`);
         } catch (error) {
             failCount++;
-            console.error(`[FAIL] ❌ ${userId}: ${error.message}`);
+            console.error(`[FAIL] ❌ ${userId}`);
         }
     }
 
@@ -191,13 +271,23 @@ async function sendSegmentToUsers(segmentData) {
 
     // تحرير الذاكرة فوراً
     buffer.fill(0);
+    state.pendingSends--;
+    
+    // تشغيل garbage collection إذا متاح
+    if (global.gc && state.pendingSends === 0) {
+        global.gc();
+    }
 }
 
-// 🚀 حلقة التسجيل المتواصل (بدون فقدان ثواني)
+// 🚀 حلقة التسجيل المتواصل - محسّنة للذاكرة
 async function continuousRecordingLoop() {
     let currentTime = 0;
+    let consecutiveErrors = 0;
+    const MAX_CONSECUTIVE_ERRORS = 5;
 
     while (state.isRecording) {
+        let segmentData = null;
+        
         try {
             state.segmentCount++;
             const segmentNum = state.segmentCount;
@@ -207,34 +297,55 @@ async function continuousRecordingLoop() {
             console.log(`${'='.repeat(60)}\n`);
 
             // تسجيل المقطع
-            const segmentData = await recordSegmentToMemory(segmentNum, currentTime);
+            segmentData = await recordSegmentOptimized(segmentNum, currentTime);
 
-            // إرسال المقطع فوراً (بينما المقطع التالي يبدأ التسجيل)
+            // نجح التسجيل
+            consecutiveErrors = 0;
+
+            // إرسال المقطع فوراً (لا ننتظر)
             if (state.isRecording && state.users.size > 0) {
-                // نرسل في الخلفية بدون انتظار
-                sendSegmentToUsers(segmentData).catch(err => {
-                    console.error(`[SEND ERROR] #${segmentNum}: ${err.message}`);
+                sendSegmentOptimized(segmentData).catch(err => {
+                    console.error(`[SEND ERROR] #${segmentNum}`);
                 });
             } else {
-                // تحرير الذاكرة إذا لم يكن هناك مستخدمين
-                segmentData.buffer.fill(0);
+                // تحرير الذاكرة
+                if (segmentData && segmentData.buffer) {
+                    segmentData.buffer.fill(0);
+                }
             }
 
-            // تحديث الوقت للمقطع التالي
+            // تحديث الوقت للمقطع التالي - بدون فجوات
             currentTime += CONFIG.SEGMENT_DURATION;
 
-            // تحرير الذاكرة دورياً
-            if (global.gc && segmentNum % 3 === 0) {
+            // تنظيف الذاكرة كل 2 مقاطع
+            if (global.gc && segmentNum % 2 === 0) {
                 global.gc();
                 const memUsage = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
                 console.log(`[MEM] ${memUsage}MB / 512MB`);
             }
 
-        } catch (error) {
-            console.error(`[ERROR] ${error.message}`);
+            // إزالة المرجع
+            segmentData = null;
 
-            // في حالة الخطأ، انتظر قليلاً قبل المحاولة مرة أخرى
-            await new Promise(resolve => setTimeout(resolve, 2000));
+        } catch (error) {
+            consecutiveErrors++;
+            console.error(`[ERROR ${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}] ${error.message}`);
+
+            // تحرير الذاكرة في حالة الخطأ
+            if (segmentData && segmentData.buffer) {
+                segmentData.buffer.fill(0);
+            }
+            segmentData = null;
+
+            if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+                console.error('[CRITICAL] Too many errors, stopping...');
+                state.isRecording = false;
+                break;
+            }
+
+            const waitTime = Math.min(1500 * consecutiveErrors, 8000);
+            console.log(`[RETRY] Waiting ${waitTime/1000}s...`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
 
             if (global.gc) global.gc();
         }
@@ -250,7 +361,8 @@ function startRecording() {
 
     state.isRecording = true;
     state.segmentCount = 0;
-    console.log('[START] 🎬 تسجيل متواصل بدون فقدان ثواني');
+    state.pendingSends = 0;
+    console.log('[START] 🎬 تسجيل متواصل بدون انقطاع');
 
     if (inactivityTimer) {
         clearTimeout(inactivityTimer);
@@ -276,6 +388,10 @@ function stopRecording() {
 
     console.log('[STOP] Recording stopped');
     resetInactivityTimer();
+
+    if (global.gc) {
+        global.gc();
+    }
 
     return true;
 }
@@ -310,7 +426,7 @@ bot.onText(/\/start/, (msg) => {
         `• 🎥 جودة عالية (CRF 23)\n` +
         `• 💫 علامة مائية متحركة\n` +
         `• ⚡ إرسال تلقائي فوري\n` +
-        `• 💾 استهلاك ذاكرة منخفض (512MB)\n\n` +
+        `• 💾 استهلاك ذاكرة منخفض جداً\n\n` +
         `━━━━━━━━━━━━━━━━━━━━\n\n` +
         `📊 كل مقطع ${CONFIG.SEGMENT_DURATION} ثانية\n` +
         `⏺️ #1 [0→${CONFIG.SEGMENT_DURATION}] → #2 [${CONFIG.SEGMENT_DURATION}→${CONFIG.SEGMENT_DURATION*2}] → #3 [${CONFIG.SEGMENT_DURATION*2}→${CONFIG.SEGMENT_DURATION*3}]\n\n` +
@@ -329,9 +445,9 @@ bot.on('callback_query', async (query) => {
             if (startRecording()) {
                 bot.sendMessage(chatId, 
                     `✅ *تم بدء التسجيل المتواصل!*\n\n` +
-                    `⏱️ المدة: ${CONFIG.SEGMENT_DURATION} ثانية لكل مقطع\n` +
-                    `💧 العلامة المائية: ${CONFIG.WATERMARK_TEXT}\n` +
-                    `🎯 تسجيل متواصل بدون فقدان أي لحظة\n\n` +
+                    `⏱️ المدة: ${CONFIG.SEGMENT_DURATION}ث لكل مقطع\n` +
+                    `💧 العلامة: ${CONFIG.WATERMARK_TEXT}\n` +
+                    `🎯 تسجيل متواصل بدون انقطاع\n\n` +
                     `⏺️ #1 [0→${CONFIG.SEGMENT_DURATION}]\n` +
                     `⏺️ #2 [${CONFIG.SEGMENT_DURATION}→${CONFIG.SEGMENT_DURATION*2}]\n` +
                     `⏺️ #3 [${CONFIG.SEGMENT_DURATION*2}→${CONFIG.SEGMENT_DURATION*3}]\n` +
@@ -348,7 +464,7 @@ bot.on('callback_query', async (query) => {
                 bot.sendMessage(chatId, 
                     `⏹️ *تم إيقاف التسجيل*\n\n` +
                     `📊 إجمالي المقاطع: ${state.segmentCount}\n` +
-                    `⏱️ إجمالي الوقت: ${state.segmentCount * CONFIG.SEGMENT_DURATION} ثانية`,
+                    `⏱️ إجمالي الوقت: ${state.segmentCount * CONFIG.SEGMENT_DURATION}ث`,
                     { parse_mode: 'Markdown' }
                 );
             } else {
@@ -366,13 +482,13 @@ bot.on('callback_query', async (query) => {
                 `━━━━━━━━━━━━━━━━━━━━\n\n` +
                 `الحالة: ${status}\n` +
                 `المقاطع: ${state.segmentCount}\n` +
-                `الوقت الكلي: ${totalTime}ث\n` +
+                `الوقت: ${totalTime}ث\n` +
                 `المستخدمين: ${state.users.size}\n` +
                 `الذاكرة: ${memory}MB / 512MB\n\n` +
                 `⚙️ *الإعدادات:*\n` +
                 `• المدة: ${CONFIG.SEGMENT_DURATION}ث\n` +
                 `• العلامة: ${CONFIG.WATERMARK_TEXT}\n` +
-                `• الوضع: تسجيل متواصل`,
+                `• الوضع: متواصل بدون فجوات`,
                 { parse_mode: 'Markdown' }
             );
             break;
@@ -381,7 +497,7 @@ bot.on('callback_query', async (query) => {
             bot.sendMessage(chatId,
                 `⚙️ *الإعدادات*\n\n` +
                 `• \`/duration ${CONFIG.SEGMENT_DURATION}\` - تغيير المدة (5-${CONFIG.MAX_DURATION}ث)\n` +
-                `• \`/watermark نص\` - تغيير العلامة المائية\n\n` +
+                `• \`/watermark نص\` - تغيير العلامة\n\n` +
                 `💡 أوقف التسجيل قبل التغيير`,
                 { parse_mode: 'Markdown' }
             );
@@ -413,7 +529,7 @@ bot.onText(/\/duration (\d+)/, (msg, match) => {
     const duration = parseInt(match[1]);
 
     if (duration < 5 || duration > CONFIG.MAX_DURATION) {
-        bot.sendMessage(msg.chat.id, `⚠️ المدة من 5 إلى ${CONFIG.MAX_DURATION} ثانية`);
+        bot.sendMessage(msg.chat.id, `⚠️ المدة من 5 إلى ${CONFIG.MAX_DURATION}ث`);
         return;
     }
 
@@ -462,7 +578,8 @@ function resetInactivityTimer() {
 
     if (!state.isRecording) {
         inactivityTimer = setTimeout(() => {
-            console.log('[AUTO-STOP] 🌙 وضع السكون بعد 30 دقيقة');
+            console.log('[AUTO-STOP] 🌙 وضع السكون');
+            if (global.gc) global.gc();
         }, INACTIVITY_TIMEOUT);
     }
 }
@@ -471,15 +588,16 @@ async function main() {
     initTempDir();
 
     console.log('╔════════════════════════════════════════╗');
-    console.log('║  Continuous Stream Recorder (512MB)  ║');
+    console.log('║   Ultra Low Memory Recorder (512MB)  ║');
     console.log('╚════════════════════════════════════════╝');
     console.log('');
     console.log(`[OK] ✅ Bot ready`);
     console.log(`[MEM] ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB / 512MB`);
     console.log(`[DUR] ${CONFIG.SEGMENT_DURATION}s per segment`);
     console.log(`[WM] ${CONFIG.WATERMARK_TEXT}`);
-    console.log(`[MODE] 🎯 Continuous recording (no gaps)`);
+    console.log(`[MODE] 🎯 Continuous (no gaps)`);
     console.log(`[PATTERN] #1[0→${CONFIG.SEGMENT_DURATION}] → #2[${CONFIG.SEGMENT_DURATION}→${CONFIG.SEGMENT_DURATION*2}] → #3[${CONFIG.SEGMENT_DURATION*2}→${CONFIG.SEGMENT_DURATION*3}]...`);
+    console.log(`[OPT] Memory optimized for 512MB`);
     console.log('');
 
     resetInactivityTimer();
@@ -489,7 +607,7 @@ async function main() {
 
     app.get('/', (req, res) => {
         res.json({
-            bot: 'Continuous Stream Recorder',
+            bot: 'Ultra Low Memory Recorder',
             status: 'online',
             recording: state.isRecording,
             segments: state.segmentCount,
@@ -497,7 +615,8 @@ async function main() {
             users: state.users.size,
             memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
             segment_duration: CONFIG.SEGMENT_DURATION + 's',
-            mode: 'continuous (no gaps)'
+            mode: 'continuous (no gaps)',
+            optimization: 'ultra low memory'
         });
     });
 
@@ -509,17 +628,19 @@ async function main() {
         });
     });
 
-    app.listen(CONFIG.PORT, () => {
-        console.log(`[SERVER] Running on port ${CONFIG.PORT}`);
+    app.listen(CONFIG.PORT, '0.0.0.0', () => {
+        console.log(`[SERVER] Running on 0.0.0.0:${CONFIG.PORT}`);
     });
 }
 
 process.on('uncaughtException', (err) => {
-    console.error('[UNCAUGHT]', err);
+    console.error('[UNCAUGHT]', err.message);
+    if (global.gc) global.gc();
 });
 
 process.on('unhandledRejection', (err) => {
-    console.error('[UNHANDLED]', err);
+    console.error('[UNHANDLED]', err.message);
+    if (global.gc) global.gc();
 });
 
 process.on('SIGTERM', () => {
@@ -534,14 +655,14 @@ process.on('SIGINT', () => {
     process.exit(0);
 });
 
-// تفعيل garbage collection
+// تفعيل garbage collection تلقائياً
 if (global.gc) {
     console.log('[MEM] ✅ Garbage collection enabled');
     setInterval(() => {
-        if (!state.isRecording) {
+        if (!state.isRecording && state.pendingSends === 0) {
             global.gc();
         }
-    }, 60000);
+    }, 45000); // كل 45 ثانية
 } else {
     console.log('[MEM] ⚠️ Run with --expose-gc for better memory');
 }
